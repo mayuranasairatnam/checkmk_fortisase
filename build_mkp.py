@@ -13,7 +13,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parent
 NAME = 'check_fortisase'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 
 def package_version(value):
@@ -65,7 +65,7 @@ def build(version=VERSION):
     files = dict(sorted(files.items()))
     metadata = {
         'name': NAME, 'title': 'FortiSASE', 'version': version,
-        'author': 'Mayuran Asairatnam', 'description': 'FortiSASE HTTPS API monitoring: PoP bandwidth, SWG/VPN sessions, remote certificates, license seats and API health.',
+        'author': 'Mayuran Asairatnam', 'description': 'FortiSASE HTTPS API monitoring: PoP bandwidth, SWG/VPN sessions, remote certificates, license seats, private-access hubs, identity providers and API health.',
         'download_url': 'https://github.com/mayuranasairatnam/checkmk_fortisase/releases/latest', 'version.min_required': '2.4.0', 'version.packaged': '2.4.0',
         'version.usable_until': '2.5.99', 'num_files': len(files),
         'files': {'cmk_addons_plugins': list(files)},

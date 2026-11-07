@@ -81,3 +81,22 @@ graph_fortisase_license_seats = catalog_graph(
     'fortisase_license_seats', 'fortisase_license_used', 'fortisase_license_free')
 graph_fortisase_license_usage = catalog_graph(
     'fortisase_license_usage', 'License seat utilization', 'fortisase_license_usage')
+
+
+metric_private_access_latency = catalog_metric('fortisase_private_access_latency', 'Maximum hub latency', Unit(DecimalNotation('ms')), Color.BLUE)
+metric_private_access_jitter = catalog_metric('fortisase_private_access_jitter', 'Maximum hub jitter', Unit(DecimalNotation('ms')), Color.PURPLE)
+metric_private_access_loss = catalog_metric('fortisase_private_access_packet_loss', 'Maximum hub packet loss', Unit(DecimalNotation('%')), Color.ORANGE)
+metric_private_access_nodes = catalog_metric('fortisase_private_access_nodes', 'Reporting nodes', SESSION_UNIT, Color.GREEN)
+graph_private_access_latency = catalog_graph('fortisase_private_access_latency', 'Hub latency', 'fortisase_private_access_latency')
+graph_private_access_jitter = catalog_graph('fortisase_private_access_jitter', 'Hub jitter', 'fortisase_private_access_jitter')
+graph_private_access_loss = catalog_graph('fortisase_private_access_packet_loss', 'Hub packet loss', 'fortisase_private_access_packet_loss')
+
+
+metric_idp_devices = catalog_metric('fortisase_idp_devices', 'IDP devices', SESSION_UNIT, Color.BLUE)
+metric_idp_users = catalog_metric('fortisase_idp_users', 'IDP users', SESSION_UNIT, Color.GREEN)
+metric_idp_count = catalog_metric('fortisase_idp_count', 'Identity providers', SESSION_UNIT, Color.PURPLE)
+metric_idp_sync_progress = catalog_metric('fortisase_idp_sync_progress', 'Synchronization progress', Unit(DecimalNotation('%')), Color.BLUE)
+metric_idp_sync_age = catalog_metric('fortisase_idp_sync_age', 'Time since successful sync', DURATION_UNIT, Color.ORANGE)
+graph_idp_counts = catalog_graph('fortisase_idp_counts', 'Identity provider devices and users', 'fortisase_idp_devices', 'fortisase_idp_users')
+graph_idp_sync_progress = catalog_graph('fortisase_idp_sync_progress', 'Identity provider synchronization progress', 'fortisase_idp_sync_progress')
+graph_idp_sync_age = catalog_graph('fortisase_idp_sync_age', 'Identity provider synchronization age', 'fortisase_idp_sync_age')

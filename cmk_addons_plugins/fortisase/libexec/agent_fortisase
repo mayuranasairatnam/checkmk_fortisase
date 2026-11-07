@@ -22,6 +22,10 @@ DEFAULT_BASE_URL = 'https://portal.prod.fortisase.com'
 CLIENT_ID = 'FortiSASE'
 EXPIRY_SKEW = 60
 SEATS_ENDPOINT = '/endpoint/fct/api/public/v1/sase_to_ems/cloud/fortiguard_cloud_vpn/get_seats'
+CONNECTIONS_ENDPOINT = '/resource-api/v1/private-access/service-connections'
+IDP_ENDPOINT = '/endpoint/fct/api/public/v1/sase_to_ems/idps/index'
+REGIONS_ENDPOINT = '/resource-api/v1/admin/config'
+HEALTH_ENDPOINT = '/resource-api/v1/security/sdwan/health'
 TRAFFIC_TYPES = ('InboundUser', 'PrivateAccess', 'InboundThinEdge', 'FortiExtender', 'Outbound', 'FortiGate')
 SECTIONS = {
     **{f'fortisase_bps_{name.lower()}': ('/monitor-api/v1/traffic-history', {'type': name})
@@ -30,6 +34,10 @@ SECTIONS = {
     'fortisase_vpn_sessions': ('/monitor-api/v1/user/vpn/sessions', None),
     'fortisase_remote_certificate': ('/resource-api/v2/system/certificate/remote-certificates', None),
     'fortisase_license': (SEATS_ENDPOINT, None),
+    'fortisase_idp': (IDP_ENDPOINT, None),
+    'fortisase_regions': (REGIONS_ENDPOINT, {'include_sites': 'true'}),
+    'fortisase_private_access_connections': (CONNECTIONS_ENDPOINT, None),
+    'fortisase_private_access_health': (HEALTH_ENDPOINT, None),
 }
 
 
@@ -373,11 +381,17 @@ class FortiSASEClient:
             raise APIError('Invalid API JSON response') from None
         if not isinstance(data, dict) or data.get('code', 200) not in (0, 200, '200'):
             raise APIError('API reported an application error')
-        payload = data.get('data')
-        if endpoint == SEATS_ENDPOINT:
+        payload = data.get('hubs') if endpoint == CONNECTIONS_ENDPOINT else data.get('data')
+        if endpoint in (SEATS_ENDPOINT, IDP_ENDPOINT):
             result = data.get('result')
             if not isinstance(result, dict) or type(result.get('retval')) is not int or result['retval'] != 1:
-                raise APIError('Seat API reported an application error')
+                label = 'Seat' if endpoint == SEATS_ENDPOINT else 'IDP'
+                raise APIError(f'{label} API reported an application error')
+            if endpoint == IDP_ENDPOINT and 'data' in data and (payload is None or payload == {}):
+                data = {**data, 'data': []}
+                payload = data['data']
+            expected = (dict,) if endpoint == SEATS_ENDPOINT else (list,)
+        elif endpoint == REGIONS_ENDPOINT:
             expected = (dict,)
         else:
             expected = (dict, list) if endpoint.endswith('traffic-history') else (list,)
@@ -389,9 +403,43 @@ class FortiSASEClient:
 
 
 
+def region_payload(data):
+    """
+    Extract node identities and location labels from the admin configuration.
+
+    Input:
+        data: Admin/config envelope with data.sites and optional nested sites.
+
+    Output:
+        Monitoring-only rows containing device_sn, region_alias and datacenter code.
+    """
+    payload = data.get('data')
+    site = payload.get('sites') if isinstance(payload, dict) else None
+    if not isinstance(site, dict):
+        raise APIError('Invalid site configuration response')
+    rows, pending = [], [site]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, dict):
+            continue
+        rows.append({key: current.get(key)
+                     for key in ('device_sn', 'region_alias', 'pop_airport_name')})
+        children = current.get('federated_sites')
+        if isinstance(children, list):
+            pending.extend(children)
+        config = current.get('config')
+        slaves = config.get('slaves') if isinstance(config, dict) else None
+        if isinstance(slaves, list):
+            for slave in slaves:
+                children = slave.get('sites') if isinstance(slave, dict) else None
+                if isinstance(children, list):
+                    pending.extend(children)
+    return {'code': 200, 'data': rows}
+
+
 def monitoring_payload(name, data):
     """
-    Select license counts without exporting unrelated response fields.
+    Select monitoring fields without exporting unrelated response configuration.
 
     Input:
         name: Agent section identifier.
@@ -401,6 +449,43 @@ def monitoring_payload(name, data):
         Whitelisted monitoring payload, or the original envelope for established sections.
 
     """
+    if name == 'fortisase_regions':
+        return region_payload(data)
+    if name == 'fortisase_private_access_connections':
+        hubs = data.get('hubs')
+        if not isinstance(hubs, list) or any(not isinstance(hub, dict) for hub in hubs):
+            raise APIError('Invalid private-access connection response')
+        return {'code': 200, 'hubs': [{
+            'seq_num': hub.get('seq_num'), 'config_state': hub.get('config_state'),
+            'config': {key: hub.get('config', {}).get(key) for key in ('alias', 'bgp_peer_ip')}
+            if isinstance(hub.get('config'), dict) else {},
+        } for hub in hubs]}
+    if name == 'fortisase_private_access_health':
+        rows = data.get('data')
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise APIError('Invalid private-access health response')
+        return {'code': 200, 'data': [{key: row.get(key)
+            for key in ('primaryKey', 'health', 'vpnTunnel', 'bgpNeighbors')} for row in rows]}
+    if name == 'fortisase_idp':
+        result, rows = data.get('result'), data.get('data')
+        if 'data' in data and (rows is None or rows == {}):
+            rows = []
+        if (not isinstance(result, dict) or type(result.get('retval')) is not int
+                or result['retval'] != 1 or not isinstance(rows, list)
+                or any(not isinstance(row, dict) for row in rows)):
+            raise APIError('Invalid identity provider response')
+        providers = []
+        for row in rows:
+            provider = {key: row.get(key) for key in ('id', 'name', 'guid', 'total_devices', 'total_users')}
+            for key, fields in (
+                    ('connection_info', ('alias', 'conn_online')),
+                    ('domain_info', ('name', 'guid')),
+                    ('group_info', ('path',)),
+                    ('status', ('online', 'last_error', 'sync_progress', 'last_success_enumerated'))):
+                value = row.get(key)
+                provider[key] = {field: value.get(field) for field in fields} if isinstance(value, dict) else value
+            providers.append(provider)
+        return {'result': {'retval': 1}, 'data': providers}
     if name == 'fortisase_license':
         payload = data.get('data')
         result = data.get('result')
@@ -457,7 +542,13 @@ def collect(client):
                     status['successful'] += 1
                 except APIError as error:
                     responses[key] = None
-                    label = endpoint + (f" ({params['type']})" if params else '')
+                    # Tenants without IDPs can return an unsupported payload shape.
+                    # Omit this optional inventory and exclude it from API coverage.
+                    if (endpoint == IDP_ENDPOINT
+                            and str(error) == 'API response has an unexpected data structure'):
+                        status['total'] -= 1
+                        continue
+                    label = endpoint + (f" ({params['type']})" if params and 'type' in params else '')
                     status['errors'].append(f'{label}: {error}')
             if responses[key] is not None:
                 emit(name, responses[key])

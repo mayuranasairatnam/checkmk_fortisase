@@ -138,7 +138,7 @@ except ImportError:
             shown = message if summary is not None or state != State.OK else ''
             super().__init__(state=state, summary=shown, notice=notice, details=details or message)
 
-    def check_levels(value, levels_lower=None, metric_name=None, **kwargs):
+    def check_levels(value, levels_lower=None, metric_name=None, levels_upper=None, **kwargs):
         """
         Apply lower warning and critical levels in the offline Checkmk double.
 
@@ -153,6 +153,9 @@ except ImportError:
         if levels_lower and levels_lower[0] == 'fixed':
             warn, crit = levels_lower[1]
             state = State.CRIT if value < crit else State.WARN if value < warn else State.OK
+        if levels_upper and levels_upper[0] == 'fixed':
+            warn, crit = levels_upper[1]
+            state = State.CRIT if value >= crit else State.WARN if value >= warn else state
         yield Result(state=state, summary=str(value))
         if metric_name:
             yield Metric(metric_name, value)
@@ -170,7 +173,7 @@ except ImportError:
 
 from cmk_addons.plugins.fortisase.agent_based import (  # noqa: E402 - Install Checkmk API doubles first.
     fortisase_api as status, fortisase_certificates as certs,
-    fortisase_license as license_check,
+    fortisase_license as license_check, fortisase_private_access as private_access, fortisase_idp as idp,
     fortisase_swg as swg, fortisase_vpn as vpn,
     fortisase_bandwidth as traffic, fortisase_pop as pop,
 )
@@ -439,6 +442,12 @@ class TransportTests(unittest.TestCase):
             """
             if params == {'type': 'FortiGate'}:
                 raise agent.APIError('API request failed (HTTP 403)')
+            if endpoint == agent.REGIONS_ENDPOINT:
+                return {'data': {'sites': {'federated_sites': []}}}
+            if endpoint == agent.IDP_ENDPOINT:
+                return {'result': {'retval': 1}, 'data': []}
+            if endpoint == agent.CONNECTIONS_ENDPOINT:
+                return {'hubs': []}
             if endpoint == agent.SEATS_ENDPOINT:
                 return {'result': {'retval': 1}, 'data': {'seats': 50, 'used': 1}}
             return {'data': []}
@@ -447,10 +456,10 @@ class TransportTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             agent.collect(client)
-        self.assertEqual(client.get.call_count, 10)
+        self.assertEqual(client.get.call_count, 14)
         lines = output.getvalue().splitlines()
         report = json.loads(lines[-1])
-        self.assertEqual(report['successful'], 9)
+        self.assertEqual(report['successful'], 13)
         self.assertEqual(len(report['errors']), 1)
         self.assertIn('<<<fortisase_vpn_sessions:sep(0)>>>', lines)
         self.assertNotIn('<<<fortisase_bps_fortigate:sep(0)>>>', lines)
@@ -1133,15 +1142,15 @@ class CheckTests(unittest.TestCase):
             The special agent's configured resource sections.
 
         Output:
-            Ten resource groups covering traffic, sessions, remote certificates and licensed seats.
+            Fourteen resource groups including private-access health, region metadata and identity providers.
 
         """
-        self.assertEqual(len(agent.SECTIONS), 10)
+        self.assertEqual(len(agent.SECTIONS), 14)
         self.assertEqual(set(path for path, _ in agent.SECTIONS.values()), {
             '/monitor-api/v1/traffic-history', '/monitor-api/v1/user/swg/sessions',
             '/monitor-api/v1/user/vpn/sessions',
             '/resource-api/v2/system/certificate/remote-certificates',
-            agent.SEATS_ENDPOINT})
+            agent.SEATS_ENDPOINT, agent.CONNECTIONS_ENDPOINT, agent.HEALTH_ENDPOINT, agent.IDP_ENDPOINT, agent.REGIONS_ENDPOINT})
 
     def test_registration_names_are_unique_and_default_sections_exist(self):
         """
@@ -1154,7 +1163,7 @@ class CheckTests(unittest.TestCase):
             None; assertions fail if the expected behavior is not met.
 
         """
-        modules = (status, certs, swg, vpn, traffic, pop, license_check)
+        modules = (status, certs, swg, vpn, traffic, pop, license_check, private_access, idp)
         sections = [v.name for m in modules for k, v in vars(m).items() if k.startswith('agent_section_')]
         plugins = [v for m in modules for k, v in vars(m).items() if k.startswith('check_plugin_')]
         self.assertEqual(len(sections), len(set(sections)))
@@ -1166,11 +1175,42 @@ class CheckTests(unittest.TestCase):
 
 
 def seat_response(seats=50, used=1):
+    """
+    Seat response.
+
+    Input:
+        seats: Licensed capacity, default 50.
+        used: Allocated seats, default 1.
+
+    Output:
+        Successful seat API response fixture using the result/data envelope.
+
+    """
     return {'result': {'retval': 1, 'message': None}, 'data': {'seats': seats, 'used': used}}
 
 
 class LicenseTests(unittest.TestCase):
+    """
+    Licensetests.
+
+    Input:
+        Test-runner constructor arguments and test fixtures defined by this class.
+
+    Output:
+        Test case instance validating the documented monitoring behavior.
+
+    """
     def test_supplied_response_produces_counts_and_two_percent_usage(self):
+        """
+        Verify supplied response produces counts and two percent usage.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         section = parsed(parse_license, seat_response())
         self.assertEqual(len(list(license_check.discover_license(section))), 1)
         results = list(license_check.check_license(section))
@@ -1179,6 +1219,16 @@ class LicenseTests(unittest.TestCase):
             'fortisase_license_used': 1, 'fortisase_license_free': 49, 'fortisase_license_usage': 2.0})
 
     def test_capacity_thresholds_full_and_overallocated(self):
+        """
+        Verify capacity thresholds full and overallocated.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         for used, expected in ((44, api.State.OK), (45, api.State.WARN),
                                (49, api.State.WARN), (50, api.State.CRIT),
                                (51, api.State.CRIT)):
@@ -1188,6 +1238,16 @@ class LicenseTests(unittest.TestCase):
                 self.assertGreaterEqual(metrics(results)['fortisase_license_free'], 0)
 
     def test_zero_capacity_does_not_invent_percentage(self):
+        """
+        Verify zero capacity does not invent percentage.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         for used, expected in ((0, api.State.WARN), (1, api.State.CRIT)):
             results = list(license_check.check_license(parsed(parse_license, seat_response(0, used))))
             self.assertEqual(results[0].state, expected)
@@ -1195,6 +1255,16 @@ class LicenseTests(unittest.TestCase):
             self.assertEqual(metrics(results)['fortisase_license_free'], 0)
 
     def test_missing_invalid_counts_and_failure_envelopes_do_not_become_zero(self):
+        """
+        Verify missing invalid counts and failure envelopes do not become zero.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         invalid = [{}, {'data': {'seats': 50, 'used': 1}},
                    {'result': {'retval': 0}, 'data': {'seats': 50, 'used': 1}},
                    {'result': {'retval': True}, 'data': {'seats': 50, 'used': 1}}]
@@ -1210,6 +1280,16 @@ class LicenseTests(unittest.TestCase):
                 self.assertEqual(metrics(results), {})
 
     def test_transport_accepts_result_envelope_using_existing_oauth_token(self):
+        """
+        Verify transport accepts result envelope using existing oauth token.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         with tempfile.TemporaryDirectory() as directory, patch.object(
                 agent, '_cache_dir', return_value=Path(directory)):
             args = agent.parse_arguments(['--api-id', 'example', '--password-from-stdin'])
@@ -1224,6 +1304,16 @@ class LicenseTests(unittest.TestCase):
             self.assertNotIn('Cookie', request.call_args.kwargs['headers'])
 
     def test_transport_rejects_http_200_application_failure(self):
+        """
+        Verify transport rejects http 200 application failure.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         with tempfile.TemporaryDirectory() as directory, patch.object(
                 agent, '_cache_dir', return_value=Path(directory)):
             args = agent.parse_arguments(['--api-id', 'example', '--password-from-stdin'])
@@ -1236,8 +1326,35 @@ class LicenseTests(unittest.TestCase):
                         client.get(agent.SEATS_ENDPOINT)
 
     def test_denied_license_request_preserves_other_services(self):
+        """
+        Verify denied license request preserves other services.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
         client = Mock()
         def get(path, params):
+            """
+            Get.
+
+            Input:
+                path: Requested resource API path.
+                params: Resource query parameters, or None.
+
+            Output:
+                Mock API response; raises APIError for the endpoint deliberately denied by the test.
+
+            """
+            if path == agent.REGIONS_ENDPOINT:
+                return {'data': {'sites': {'federated_sites': []}}}
+            if path == agent.IDP_ENDPOINT:
+                return {'result': {'retval': 1}, 'data': []}
+            if path == agent.CONNECTIONS_ENDPOINT:
+                return {'hubs': []}
             if path == agent.SEATS_ENDPOINT:
                 raise agent.APIError('API request failed (HTTP 403)')
             return {'data': []}
@@ -1247,10 +1364,754 @@ class LicenseTests(unittest.TestCase):
             agent.collect(client)
         lines = output.getvalue().splitlines()
         report = json.loads(lines[-1])
-        self.assertEqual(report['successful'], 9)
-        self.assertEqual(report['total'], 10)
+        self.assertEqual(report['successful'], 13)
+        self.assertEqual(report['total'], 14)
         self.assertNotIn('<<<fortisase_license:sep(0)>>>', lines)
         self.assertIn('<<<fortisase_swg_sessions:sep(0)>>>', lines)
+
+
+class PrivateAccessTests(unittest.TestCase):
+    """
+    Exercise hub correlation, node failures, measurement limits and API envelopes.
+
+    Input:
+        Test-runner constructor arguments and test fixtures defined by this class.
+
+    Output:
+        Test case instance validating the documented monitoring behavior.
+
+    """
+    def setUp(self):
+        """
+        Prepare an anonymized two-node hub fixture matching the supplied schema.
+
+        Input:
+            self: Private-access test case created by the unittest runner.
+
+        Output:
+            None; initializes anonymized hub configuration and two reporting-node fixtures.
+
+        """
+        self.connections = {'code': 200, 'hubs': [{
+            'seq_num': 1, 'config_state': 'success',
+            'config': {'alias': 'Test Hub', 'bgp_peer_ip': '192.0.2.254', 'auth': 'not-exported'},
+            'common_config': {'internal': 'not-exported'},
+        }]}
+        self.health = {'code': 200, 'data': [{
+            'primaryKey': serial,
+            'health': {'hub1': {'status': 'up', 'latency': latency, 'jitter': 0.5, 'packetLoss': 0.0}},
+            'vpnTunnel': {'hub1': 'up', 'default-ipsec': 'down', 'unrelated': 'down'},
+            'bgpNeighbors': {'192.0.2.254': 'Established', '192.0.2.123': 'Idle'},
+        } for serial, latency in [('node-a', 6.0), ('node-b', 143.5)]]}
+
+    def results(self, kind, params=None):
+        """
+        Run registered checks with Checkmk-style named section binding.
+
+        Input:
+            kind: vpn, bgp or health check.
+            params: Optional link thresholds; defaults to the plugin levels.
+
+        Output:
+            Materialized check results and metrics evaluated from the current test fixtures.
+
+        """
+        args = dict(item='Test Hub',
+                    section_fortisase_private_access_connections=parsed(
+                        private_access.parse_connections, self.connections),
+                    section_fortisase_private_access_health=parsed(private_access.parse_health, self.health))
+        if kind == 'health':
+            args['params'] = params or private_access.DEFAULT_LEVELS
+        return list(getattr(private_access, 'check_' + kind)(**args))
+
+    def test_discovery_and_unrelated_down_tunnels(self):
+        """
+        Discover the alias once and ignore tunnel/neighbor states of other hubs.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        hubs = parsed(private_access.parse_connections, self.connections)
+        found = list(private_access.discover_private_access(hubs, None))
+        self.assertEqual([service.item for service in found], ['Test Hub'])
+        for kind in ('vpn', 'bgp', 'health'):
+            with self.subTest(kind=kind):
+                results = self.results(kind)
+                self.assertTrue(all(r.state == api.State.OK for r in results if hasattr(r, 'state')))
+                self.assertEqual(metrics(results)['fortisase_private_access_nodes'], 2)
+        self.assertEqual(metrics(self.results('health'))['fortisase_private_access_latency'], 143.5)
+        self.assertEqual(metrics(self.results('health'))['fortisase_private_access_packet_loss'], 0.0)
+
+    def test_one_failed_node_is_critical(self):
+        """
+        Retain failures even when the other node reports a healthy connection.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        for kind, field, value in [('vpn', 'vpnTunnel', 'down'), ('bgp', 'bgpNeighbors', 'Idle')]:
+            key = 'hub1' if kind == 'vpn' else '192.0.2.254'
+            self.health['data'][1][field][key] = value
+            self.assertIn(api.State.CRIT, [r.state for r in self.results(kind) if hasattr(r, 'state')])
+        self.health['data'][1]['health']['hub1']['status'] = 'down'
+        self.assertIn(api.State.CRIT, [r.state for r in self.results('health') if hasattr(r, 'state')])
+
+    def test_unknown_and_missing_node_data(self):
+        """
+        Report absent or unrecognized states as UNKNOWN rather than healthy.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        for kind in ('vpn', 'bgp', 'health'):
+            original = self.health['data']
+            self.health['data'] = []
+            self.assertEqual(self.results(kind)[0].state, api.State.UNKNOWN)
+            self.health['data'] = original
+        self.health['data'][1]['vpnTunnel']['hub1'] = 'unexpected'
+        self.assertIn(api.State.UNKNOWN, [r.state for r in self.results('vpn') if hasattr(r, 'state')])
+        del self.health['data'][1]['bgpNeighbors']['192.0.2.254']
+        self.assertIn(api.State.UNKNOWN, [r.state for r in self.results('bgp') if hasattr(r, 'state')])
+
+    def test_config_failure_and_missing_hub(self):
+        """
+        Surface failed provisioning and stale discovered hub items.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        self.connections['hubs'][0]['config_state'] = 'failed'
+        self.assertEqual(self.results('vpn')[0].state, api.State.CRIT)
+        self.connections['hubs'] = []
+        self.assertEqual(self.results('vpn')[0].state, api.State.UNKNOWN)
+
+    def test_link_thresholds_and_invalid_measurements(self):
+        """
+        Check exact upper boundaries, configurable limits and malformed samples.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        link = self.health['data'][1]['health']['hub1']
+        for value, expected in [(150.0, api.State.WARN), (300.0, api.State.CRIT)]:
+            link['latency'] = value
+            self.assertIn(expected, [r.state for r in self.results('health') if hasattr(r, 'state')])
+        link['latency'] = 100.0
+        limits = dict(private_access.DEFAULT_LEVELS, latency=('fixed', (50.0, 90.0)))
+        self.assertIn(api.State.CRIT, [r.state for r in self.results('health', limits) if hasattr(r, 'state')])
+        for value in (None, True, -1, 'bad'):
+            link['jitter'] = value
+            self.assertIn(api.State.UNKNOWN, [r.state for r in self.results('health') if hasattr(r, 'state')])
+        link['packetLoss'] = 101
+        self.assertIn(api.State.UNKNOWN, [r.state for r in self.results('health') if hasattr(r, 'state')])
+
+    def test_ambiguous_hubs_and_nodes_are_rejected(self):
+        """
+        Reject duplicate identities and malformed response envelopes.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        self.connections['hubs'] *= 2
+        self.assertIsNone(parsed(private_access.parse_connections, self.connections))
+        self.health['data'] *= 2
+        self.assertIsNone(parsed(private_access.parse_health, self.health))
+        for parser in (private_access.parse_connections, private_access.parse_health):
+            self.assertIsNone(parser([['invalid json']]))
+            self.assertIsNone(parsed(parser, {'code': 403, 'data': []}))
+
+    def test_transport_accepts_hubs_envelope_and_filters_configuration(self):
+        """
+        Use existing OAuth authentication without retaining configuration secrets.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            client._token = 'collector-token'
+            with patch.object(client, '_request', return_value=response(self.connections)):
+                raw = client.get(agent.CONNECTIONS_ENDPOINT)
+            filtered = agent.monitoring_payload('fortisase_private_access_connections', raw)
+            self.assertNotIn('not-exported', json.dumps(filtered))
+            self.assertEqual(parsed(private_access.parse_connections, filtered)['Test Hub']['key'], 'hub1')
+
+    def test_sequence_number_selects_only_its_hub(self):
+        """
+        Resolve non-positional hub keys and reject a missing configured BGP peer.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        self.connections['hubs'][0]['seq_num'] = 7
+        for node in self.health['data']:
+            node['health']['hub7'] = node['health'].pop('hub1')
+            node['vpnTunnel']['hub7'] = node['vpnTunnel'].pop('hub1')
+            node['vpnTunnel']['hub1'] = 'down'
+        self.assertTrue(all(r.state == api.State.OK for r in self.results('vpn') if hasattr(r, 'state')))
+        self.connections['hubs'][0]['config'].pop('bgp_peer_ip')
+        self.assertIn(api.State.UNKNOWN, [r.state for r in self.results('bgp') if hasattr(r, 'state')])
+
+    def test_access_denied_preserves_existing_services(self):
+        """
+        Keep other services and API diagnostics when private-access access is denied.
+
+        Input:
+            self: Test case instance; mocked API responses and scenario data defined in the test.
+
+        Output:
+            None; assertions verify expected states, metrics or transport behavior and fail on regressions.
+
+        """
+        client = Mock()
+        def get(path, params):
+            """
+            Get.
+
+            Input:
+                path: Requested resource API path.
+                params: Resource query parameters, or None.
+
+            Output:
+                Mock API response; raises APIError for the endpoint deliberately denied by the test.
+
+            """
+            if path == agent.REGIONS_ENDPOINT:
+                return {'data': {'sites': {'federated_sites': []}}}
+            if path == agent.IDP_ENDPOINT:
+                return {'result': {'retval': 1}, 'data': []}
+            if path in (agent.CONNECTIONS_ENDPOINT, agent.HEALTH_ENDPOINT):
+                raise agent.APIError('API request failed (HTTP 403)')
+            if path == agent.SEATS_ENDPOINT:
+                return seat_response()
+            return {'data': []}
+        client.get.side_effect = get
+        output = io.StringIO()
+        with redirect_stdout(output):
+            agent.collect(client)
+        lines = output.getvalue().splitlines()
+        report = json.loads(lines[-1])
+        self.assertEqual((report['successful'], report['total']), (12, 14))
+        self.assertEqual(len(report['errors']), 2)
+        self.assertIn('<<<fortisase_license:sep(0)>>>', lines)
+
+
+class IdentityProviderTests(unittest.TestCase):
+    """
+    Verify EMS-compatible provider availability, rendering and synchronization checks.
+
+    Input:
+        Anonymized provider records matching the supplied FortiSASE response.
+
+    Output:
+        Assertions for domain/GUID output, metrics, error states and API isolation.
+    """
+    def setUp(self):
+        """
+        Prepare a successful directory synchronization snapshot.
+
+        Input:
+            self: Test case created by unittest.
+
+        Output:
+            Response fixture and a fixed UTC evaluation time.
+        """
+        self.now = datetime(2026, 11, 7, 12, 58, 14, tzinfo=timezone.utc)
+        self.entry = {
+            'guid': '00000000-0000-4000-8000-000000000001',
+            'total_devices': 27, 'total_users': 5,
+            'connection_info': {'conn_online': True, 'alias': None, 'user': 'not-exported'},
+            'status': {'online': True, 'last_error': '', 'sync_progress': 100,
+                       'last_success_enumerated': '2026-11-07T12:33:05'},
+            'domain_info': {'name': 'example.test', 'guid': '00000000-0000-4000-8000-000000000001'},
+            'group_info': {'path': 'example.test'},
+        }
+        self.response = {'result': {'retval': 1, 'message': None}, 'data': [self.entry]}
+
+    def results(self, params=None):
+        """
+        Evaluate the current response using deterministic UTC time.
+
+        Input:
+            params: Optional IDP check parameter overrides.
+
+        Output:
+            Materialized check results and metrics for example.test.
+        """
+        section = parsed(idp.parse_idps, self.response)
+        with patch.object(idp, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = self.now
+            return list(idp.check_idp('example.test', params or idp.DEFAULT_PARAMETERS, section))
+
+    def test_domain_guid_and_ems_style_output(self):
+        """
+        Preserve the EMS rendering and all requested provider measurements.
+
+        Input:
+            Successful provider with a timezone-less UTC sync timestamp.
+
+        Output:
+            Readable item, healthy status, counts, progress and sync age in seconds.
+        """
+        section = parsed(idp.parse_idps, self.response)
+        self.assertEqual([s.item for s in idp.discover_idps(section)], ['example.test'])
+        results = self.results()
+        summaries = [r.summary for r in results if hasattr(r, 'state')]
+        for expected in ('Domain: example.test', 'GUID: '+self.entry['guid'], 'IDP: online',
+                         'Connector: online', 'No synchronization error', 'Devices: 27', 'Users: 5',
+                         'Sync progress: 100%', 'Last successful sync: 2026-11-07T12:33:05+00:00'):
+            self.assertIn(expected, summaries)
+        self.assertTrue(all(r.state == api.State.OK for r in results if hasattr(r, 'state')))
+        self.assertEqual(metrics(results), {'fortisase_idp_devices': 27, 'fortisase_idp_users': 5,
+                         'fortisase_idp_sync_progress': 100, 'fortisase_idp_sync_age': 1509})
+
+    def test_offline_connector_and_sync_error_states(self):
+        """
+        Honor configurable failure severity for provider and connector outages.
+
+        Input:
+            Offline IDP/connector or a non-empty synchronization error.
+
+        Output:
+            CRIT by default, WARN when the corresponding rule is changed.
+        """
+        for container, key, value, setting in (
+                ('status', 'online', False, 'offline_state'),
+                ('connection_info', 'conn_online', False, 'connector_state'),
+                ('status', 'last_error', 'Directory unavailable', 'error_state')):
+            original = self.entry[container][key]
+            self.entry[container][key] = value
+            self.assertIn(api.State.CRIT, [r.state for r in self.results() if hasattr(r, 'state')])
+            params = dict(idp.DEFAULT_PARAMETERS, **{setting: 'warn'})
+            states = [r.state for r in self.results(params) if hasattr(r, 'state')]
+            self.assertIn(api.State.WARN, states)
+            self.assertNotIn(api.State.CRIT, states)
+            self.entry[container][key] = original
+
+    def test_sync_age_thresholds(self):
+        """
+        Evaluate upper synchronization age boundaries in seconds.
+
+        Input:
+            Last successful synchronization exactly one or two days ago.
+
+        Output:
+            WARN after 24 hours and CRIT after 48 hours.
+        """
+        for stamp, state in [('2026-11-06T12:58:14Z', api.State.WARN),
+                             ('2026-11-05T12:58:14+00:00', api.State.CRIT)]:
+            self.entry['status']['last_success_enumerated'] = stamp
+            self.assertIn(state, [r.state for r in self.results() if hasattr(r, 'state')])
+
+    def test_missing_future_dates_and_invalid_measurements(self):
+        """
+        Reject missing/future timestamps and malformed status measurements.
+
+        Input:
+            Missing, invalid and future sync dates; invalid progress and counters.
+
+        Output:
+            UNKNOWN diagnostics with no fabricated values or negative sync age.
+        """
+        for stamp in (None, 'bad', '2026-11-08T12:58:14Z'):
+            self.entry['status']['last_success_enumerated'] = stamp
+            results = self.results()
+            self.assertIn(api.State.UNKNOWN, [r.state for r in results if hasattr(r, 'state')])
+            self.assertNotIn('fortisase_idp_sync_age', metrics(results))
+        self.entry['status']['last_success_enumerated'] = '2026-11-07T12:33:05'
+        self.entry['status']['sync_progress'] = 101
+        self.entry['total_devices'] = True
+        self.entry['connection_info']['conn_online'] = None
+        results = self.results()
+        self.assertIn(api.State.UNKNOWN, [r.state for r in results if hasattr(r, 'state')])
+        self.assertNotIn('fortisase_idp_devices', metrics(results))
+        self.assertNotIn('fortisase_idp_sync_progress', metrics(results))
+
+    def test_empty_invalid_and_ambiguous_inventory(self):
+        """
+        Distinguish no providers from invalid API data and duplicate names.
+
+        Input:
+            Empty successful inventory, duplicate entries and failed API envelopes.
+
+        Output:
+            Zero inventory is healthy; ambiguous/invalid records remain UNKNOWN.
+        """
+        empty = parsed(idp.parse_idps, {'result': {'retval': 1}, 'data': []})
+        self.assertEqual(list(idp.discover_idps(empty)), [])
+        self.assertEqual(metrics(list(idp.check_summary(empty)))['fortisase_idp_count'], 0)
+        self.response['data'] *= 2
+        section = parsed(idp.parse_idps, self.response)
+        self.assertEqual(list(idp.check_summary(section))[0].state, api.State.UNKNOWN)
+        self.assertEqual(list(idp.check_idp('example.test', {}, section))[0].state, api.State.UNKNOWN)
+        for retval in (None, 0, True, '1'):
+            invalid = parsed(idp.parse_idps, {'result': {'retval': retval}, 'data': []})
+            self.assertEqual(list(idp.check_summary(invalid))[0].state, api.State.UNKNOWN)
+
+    def test_transport_validation_and_whitelist(self):
+        """
+        Fetch the IDP envelope using OAuth and omit unrelated connector fields.
+
+        Input:
+            Successful and failed application responses returned with HTTP 200.
+
+        Output:
+            Accepted response with monitoring-only output; failures raise APIError.
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            client._token = 'collector-token'
+            with patch.object(client, '_request', return_value=response(self.response)) as request:
+                raw = client.get(agent.IDP_ENDPOINT)
+                self.assertEqual(request.call_args.kwargs['headers']['Authorization'], 'Bearer collector-token')
+            filtered = agent.monitoring_payload('fortisase_idp', raw)
+            self.assertNotIn('not-exported', json.dumps(filtered))
+            self.assertEqual(parsed(idp.parse_idps, filtered)['count'], 1)
+            client._memo.clear()
+            with patch.object(client, '_request', return_value=response({'result': {'retval': 0}, 'data': []})):
+                with self.assertRaises(agent.APIError):
+                    client.get(agent.IDP_ENDPOINT)
+
+    def test_empty_idp_payload_forms_remain_successful(self):
+        """
+        Accept explicit empty payloads when no provider is configured.
+
+        Input:
+            Successful IDP responses with data null, an empty object or an empty list.
+
+        Output:
+            Successful collection, zero inventory and no discovered IDP items.
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            client._token = 'collector-token'
+            for value in (None, {}, []):
+                with self.subTest(data=value):
+                    raw = {'result': {'retval': 1}, 'data': value}
+                    client._memo.clear()
+                    with patch.object(client, '_request', return_value=response(raw)):
+                        accepted = client.get(agent.IDP_ENDPOINT)
+                    filtered = agent.monitoring_payload('fortisase_idp', accepted)
+                    self.assertEqual(filtered['data'], [])
+                    self.assertEqual(agent.monitoring_payload('fortisase_idp', raw)['data'], [])
+                    section = parsed(idp.parse_idps, raw)
+                    self.assertTrue(section['valid'])
+                    self.assertEqual(list(idp.discover_idps(section)), [])
+                    results = list(idp.check_summary(section))
+                    self.assertEqual(results[0].state, api.State.OK)
+                    self.assertEqual(metrics(results)['fortisase_idp_count'], 0)
+
+    def test_missing_and_nonempty_invalid_idp_payloads_remain_errors(self):
+        """
+        Do not turn application failures or unsupported data shapes into empty inventories.
+
+        Input:
+            Missing data, non-empty objects, scalar values and failed retval values.
+
+        Output:
+            Transport/API errors and UNKNOWN inventory diagnostics.
+        """
+        cases = [{'result': {'retval': 1}},
+                 *[{'result': {'retval': 1}, 'data': value}
+                   for value in ({'unexpected': []}, '', 0, False)],
+                 *[{'result': {'retval': value}, 'data': None} for value in (0, True, '1')]]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            for raw in cases:
+                with self.subTest(raw=raw), patch.object(client, '_request', return_value=response(raw)):
+                    client._memo.clear()
+                    with self.assertRaises(agent.APIError):
+                        client.get(agent.IDP_ENDPOINT)
+                    with self.assertRaises(agent.APIError):
+                        agent.monitoring_payload('fortisase_idp', raw)
+                    section = parsed(idp.parse_idps, raw)
+                    self.assertFalse(section['valid'])
+                    self.assertEqual(list(idp.check_summary(section))[0].state, api.State.UNKNOWN)
+
+    def test_unexpected_idp_structure_skips_discovery_without_api_warning(self):
+        """Skip unsupported IDP payloads while retaining healthy API coverage."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            for payload in ({'result': {'retval': 1}},
+                            {'result': {'retval': 1}, 'data': ''},
+                            {'result': {'retval': 1}, 'data': {'unexpected': []}}):
+                with self.subTest(payload=payload):
+                    client._memo.clear()
+                    output = io.StringIO()
+                    sections = {'fortisase_idp': (agent.IDP_ENDPOINT, None),
+                                'fortisase_vpn_sessions': ('/test/sessions', None)}
+                    with patch.object(agent, 'SECTIONS', sections), patch.object(
+                            client, 'authenticate'), patch.object(client, '_request', side_effect=[
+                                response(payload), response({'data': []})]), redirect_stdout(output):
+                        agent.collect(client)
+                    lines = output.getvalue().splitlines()
+                    self.assertNotIn('<<<fortisase_idp:sep(0)>>>', lines)
+                    self.assertIn('<<<fortisase_vpn_sessions:sep(0)>>>', lines)
+                    report = json.loads(lines[-1])
+                    self.assertEqual(report['errors'], [])
+                    self.assertEqual((report['successful'], report['total']), (1, 1))
+                    self.assertEqual(list(status.check_api(report))[0].state, api.State.OK)
+
+    def test_denied_idp_query_preserves_other_sections(self):
+        """
+        Isolate a denied IDP endpoint from existing monitoring services.
+
+        Input:
+            Collector fixture returning HTTP 403 only for the IDP API.
+
+        Output:
+            Twelve successful queries, one API error and preserved session sections.
+        """
+        client = Mock()
+        def get(path, params):
+            """
+            Return supported envelopes for all resources except IDP.
+
+            Input:
+                path: Resource endpoint; params: Optional traffic query.
+
+            Output:
+                Successful fixture or APIError for the deliberately denied endpoint.
+            """
+            if path == agent.REGIONS_ENDPOINT:
+                return {'data': {'sites': {'federated_sites': []}}}
+            if path == agent.IDP_ENDPOINT:
+                raise agent.APIError('API request failed (HTTP 403)')
+            if path == agent.CONNECTIONS_ENDPOINT:
+                return {'hubs': []}
+            if path == agent.SEATS_ENDPOINT:
+                return seat_response()
+            return {'data': []}
+        client.get.side_effect = get
+        output = io.StringIO()
+        with redirect_stdout(output):
+            agent.collect(client)
+        lines = output.getvalue().splitlines()
+        report = json.loads(lines[-1])
+        self.assertEqual((report['successful'], report['total']), (13, 14))
+        self.assertEqual(len(report['errors']), 1)
+        self.assertIn('<<<fortisase_vpn_sessions:sep(0)>>>', lines)
+
+
+class RegionAliasTests(unittest.TestCase):
+    """
+    Verify stable node identity joins and readable private-access location output.
+
+    Input:
+        Hub/node fixtures plus admin-config site metadata.
+
+    Output:
+        Assertions for city/datacenter labels, sanitization and safe fallbacks.
+    """
+    setUp = PrivateAccessTests.setUp
+
+    def config(self):
+        """
+        Build nested metadata independent of health record ordering.
+
+        Input:
+            None; node-b is deliberately listed before node-a.
+
+        Output:
+            Admin-config response containing duplicate nested site references.
+        """
+        return {'code': 200, 'data': {'context': {'secret': 'not-exported'}, 'sites': {
+            'invitation_code': 'not-exported',
+            'federated_sites': [
+                {'device_sn': 'node-b', 'region_alias': 'Bangalore (India) (F)',
+                 'pop_airport_name': 'blr-f1', 'invitation_code': 'not-exported'},
+                {'device_sn': 'node-a', 'region_alias': 'Zurich (Switzerland) (G)',
+                 'pop_airport_name': 'zrh-g2'}],
+            'config': {'slaves': [{'sites': [
+                {'device_sn': 'node-b', 'region_alias': 'Bangalore (India) (F)'}]}]},
+        }}}
+
+    def test_all_three_checks_use_city_and_datacenter(self):
+        """
+        Render node labels by serial identity while preserving raw IDs in details.
+
+        Input:
+            Two node identities and reversed-order site metadata.
+
+        Output:
+            Zurich/Bangalore labels in VPN, BGP and health summaries.
+        """
+        regions = parsed(private_access.parse_regions, agent.region_payload(self.config()))
+        self.assertEqual(regions, {'node-a': 'Zurich (zrh-g2)', 'node-b': 'Bangalore (blr-f1)'})
+        for kind in ('vpn', 'bgp', 'health'):
+            results = list(private_access.evaluate('Test Hub',
+                parsed(private_access.parse_connections, self.connections),
+                parsed(private_access.parse_health, self.health), kind, regions=regions))
+            summaries = [r.summary for r in results if hasattr(r, 'state')]
+            self.assertTrue(any(line.startswith('Zurich (zrh-g2):') for line in summaries))
+            self.assertTrue(any(line.startswith('Bangalore (blr-f1):') for line in summaries))
+            self.assertFalse(any('node-a' in line or 'node-b' in line for line in summaries))
+            self.assertTrue(any('Node: node-a' in r.details for r in results if hasattr(r, 'details')))
+            kwargs = {'item': 'Test Hub', 'section_fortisase_private_access_connections':
+                parsed(private_access.parse_connections, self.connections),
+                'section_fortisase_private_access_health': parsed(private_access.parse_health, self.health),
+                'section_fortisase_regions': regions}
+            if kind == 'health':
+                kwargs['params'] = private_access.DEFAULT_LEVELS
+            registered = list(getattr(private_access, 'check_'+kind)(**kwargs))
+            self.assertTrue(any(getattr(r, 'summary', '').startswith('Bangalore (blr-f1):') for r in registered))
+
+    def test_invalid_measurements_use_location_label(self):
+        """
+        Keep location naming consistent in error messages as well as healthy states.
+
+        Input:
+            Missing jitter on a known node.
+
+        Output:
+            UNKNOWN message prefixed by city/datacenter instead of serial number.
+        """
+        self.health['data'][0]['health']['hub1']['jitter'] = None
+        results = list(private_access.evaluate('Test Hub',
+            parsed(private_access.parse_connections, self.connections),
+            parsed(private_access.parse_health, self.health), 'health',
+            regions={'node-a': 'Zurich (zrh-g2)'}))
+        self.assertTrue(any(getattr(r, 'summary', '') == 'Zurich (zrh-g2): missing or invalid jitter'
+                            for r in results))
+
+    def test_missing_or_conflicting_metadata_falls_back_to_serial(self):
+        """
+        Avoid assigning a node to a guessed region when metadata is incomplete.
+
+        Input:
+            Failed metadata envelope, missing datacenter and contradictory aliases.
+
+        Output:
+            Empty/partial mappings with stable serial fallback and unchanged health.
+        """
+        self.assertEqual(parsed(private_access.parse_regions, {'code': 403, 'data': []}), {})
+        self.assertEqual(private_access.parse_regions([['broken']]), {})
+        raw = agent.region_payload(self.config())
+        raw['data'].append({'device_sn': 'node-a', 'region_alias': 'Other', 'pop_airport_name': 'other-g1'})
+        regions = parsed(private_access.parse_regions, raw)
+        self.assertNotIn('node-a', regions)
+        results = list(private_access.evaluate('Test Hub',
+            parsed(private_access.parse_connections, self.connections),
+            parsed(private_access.parse_health, self.health), 'vpn', regions=regions))
+        self.assertTrue(any(getattr(r, 'summary', '').startswith('node-a:') for r in results))
+        self.assertTrue(all(r.state == api.State.OK for r in results if hasattr(r, 'state')))
+        only_alias = parsed(private_access.parse_regions, {'data': [
+            {'device_sn': 'node-a', 'region_alias': 'Zurich (Switzerland) (G)'}]})
+        self.assertEqual(only_alias['node-a'], 'Zurich (Switzerland) (G)')
+
+    def test_metadata_transport_and_whitelist(self):
+        """
+        Accept the object response and export only node/region naming fields.
+
+        Input:
+            Admin-config response with unrelated sensitive tenant configuration.
+
+        Output:
+            Validated OAuth request, include_sites query and sanitized labels.
+        """
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                agent, '_cache_dir', return_value=Path(directory)):
+            client = agent.FortiSASEClient(agent.parse_arguments(
+                ['--api-id', 'example', '--password-from-stdin']), 'test-password')
+            self.addCleanup(client.session.close)
+            client._token = 'collector-token'
+            with patch.object(client, '_request', return_value=response(self.config())) as request:
+                raw = client.get(agent.REGIONS_ENDPOINT, {'include_sites': 'true'})
+                self.assertEqual(request.call_args.kwargs['params'], {'include_sites': 'true'})
+            filtered = agent.monitoring_payload('fortisase_regions', raw)
+            self.assertNotIn('not-exported', json.dumps(filtered))
+            self.assertEqual(len(parsed(private_access.parse_regions, filtered)), 2)
+            with self.assertRaises(agent.APIError):
+                agent.region_payload({'data': {'sites': []}})
+
+    def test_denied_region_query_preserves_private_access_sections(self):
+        """
+        Isolate missing naming metadata from existing hub monitoring data.
+
+        Input:
+            HTTP 403 for admin/config while hub and health endpoints succeed.
+
+        Output:
+            API warning data, preserved private-access sections and no region section.
+        """
+        client = Mock()
+        def get(path, params):
+            """
+            Return valid fixtures except for the deliberately denied config endpoint.
+
+            Input:
+                path: Requested endpoint; params: Optional query parameters.
+
+            Output:
+                API fixture or APIError for unavailable region metadata.
+            """
+            if path == agent.REGIONS_ENDPOINT:
+                raise agent.APIError('API request failed (HTTP 403)')
+            if path == agent.CONNECTIONS_ENDPOINT:
+                return self.connections
+            if path == agent.HEALTH_ENDPOINT:
+                return self.health
+            if path == agent.IDP_ENDPOINT:
+                return {'result': {'retval': 1}, 'data': []}
+            if path == agent.SEATS_ENDPOINT:
+                return seat_response()
+            return {'data': []}
+        client.get.side_effect = get
+        output = io.StringIO()
+        with redirect_stdout(output):
+            agent.collect(client)
+        lines = output.getvalue().splitlines()
+        report = json.loads(lines[-1])
+        self.assertEqual((report['successful'], report['total']), (13, 14))
+        self.assertNotIn('<<<fortisase_regions:sep(0)>>>', lines)
+        self.assertIn('<<<fortisase_private_access_health:sep(0)>>>', lines)
 
 
 if __name__ == '__main__':

@@ -6,7 +6,7 @@
 
 ---
 
-Author: **Mayuran Asairatnam** · Package: **check_fortisase**
+Author: **Mayuran Asairatnam** · Package: **check_fortisase** · Version: **1.0.1**
 
 Monitor FortiSASE through a native Checkmk special agent using FortiCloud OAuth.
 No agent needs to be installed on an appliance.
@@ -25,6 +25,11 @@ No agent needs to be installed on an appliance.
 | FortiSASE FortiGate Bandwidth &lt;region&gt; | FortiGate receive/transmit or unclassified throughput |
 | FortiSASE Certificate &lt;certificate&gt; | Remaining lifetime; default WARN below 30 days, CRIT below 14 days |
 | FortiSASE License | Licensed, used and free seats plus utilization; WARN from 90%, CRIT from 100% |
+| FortiSASE Identity Providers | Provider inventory and identity validation |
+| FortiSASE IDP &lt;provider&gt; | Domain/GUID, IDP and connector status, sync errors, devices, users, progress and sync age |
+| FortiSASE Private Access &lt;hub&gt; VPN Status | Configured hub tunnel status across reporting nodes |
+| FortiSASE Private Access &lt;hub&gt; Link Health | Link status and maximum latency, jitter and packet loss across reporting nodes |
+| FortiSASE Private Access &lt;hub&gt; BGP Status | Configured BGP neighbor state across reporting nodes |
 
 Location names use `city (datacenter)` when the API provides both identifiers.
 For example: `FortiSASE SWG Zurich (zrh-g2)`. The SSO certificate appears as
@@ -33,29 +38,37 @@ certificate is returned.
 
 InboundUser and Outbound rates are collected once per location in the VPN/SWG
 bandwidth service. SWG and VPN services retain their own session measurements.
-Only remote certificates are collected.
+Only remote certificates are collected. Private-access services use hub aliases;
+link alert levels are configurable. Node summaries use city/datacenter labels
+from the site configuration, with raw identities retained in details.
+See the monitoring reference for node
+aggregation and the sequence-number mapping used in version 1.0.1.
+
+If the optional IDP endpoint returns `API response has an unexpected data structure`,
+the collector skips IDP service discovery without triggering an API warning.
+Authentication and permission errors remain visible.
 
 See the [monitoring reference](docs/monitoring.md) for metrics, graphs and alert behavior.
 
 ## Installation
 
-1. Build with `python3 -B build_mkp.py`, or download an available release MKP.
-2. Install and enable the package in **Setup → Maintenance → Extension packages**.
-3. Create one host per tenant with **No IP** and **Configured API integrations, no Checkmk agent**.
-4. Add a **FortiSASE** integration rule with the dedicated FortiCloud API ID and password.
-5. Activate changes, discover services and accept them.
+1. Download and enable the MKP under **Setup → Maintenance → Extension packages**.
+2. Create the monitoring host with **Configured API integrations, no Checkmk agent**.
+3. In **Setup**, search for **FortiSASE**, create an integration rule and restrict it to the host.
+4. Enter the required credentials and review the monitoring scope and connection settings.
+5. Save the rule, activate changes, run service discovery and accept the services.
 
-TLS verification is enabled. Credentials resolve through the Checkmk Password
-Store; passwords and OAuth tokens are not put into process arguments.
-See [installation](docs/installation.md) for commands and migration details.
+See [installation](docs/installation.md) for the exact fields and defaults,
+[authentication](docs/authentication.md) for account permissions, and
+[monitoring](docs/monitoring.md) for services and thresholds.
 
 ## Compatibility and validation
 
 Supports Checkmk **2.4 and 2.5**. Python **3.11+** and `requests` are required.
-All monitoring functions, including license seat monitoring with FortiCloud API
-credentials, have been live-tested by the maintainer against a FortiSASE tenant
-in Checkmk. Automated tests cover transport, token lifecycle, session and
-bandwidth checks, certificate expiry, license seat allocation and reproducible
+Traffic, session, certificate, license, private-access hub and identity-provider
+monitoring have been live-tested by the maintainer with FortiCloud API
+credentials and Checkmk, including service discovery. Automated regression
+tests additionally cover transport, token lifecycle, checks and reproducible
 packaging.
 
 ## Tested environments
@@ -69,8 +82,8 @@ packaging.
 
 | Guide | Contents |
 | --- | --- |
-| [Installation](docs/installation.md) | Host setup, settings, CLI and migration |
-| [Authentication and API access](docs/authentication.md) | Credentials, OAuth cache, endpoints and errors |
+| [Installation](docs/installation.md) | Host setup, settings and connection checks |
+| [Authentication and API access](docs/authentication.md) | Local permission profile, API credentials and access errors |
 | [Monitoring reference](docs/monitoring.md) | Services, metrics, units, thresholds and graphs |
 | [Development](docs/development.md) | Layout, tests, builds, CI and release workflow |
 
