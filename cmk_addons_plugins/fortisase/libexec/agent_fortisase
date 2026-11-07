@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+Collect FortiSASE traffic, sessions and certificates using FortiCloud OAuth.
+"""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+import requests
+
+AUTH_URL = 'https://customerapiauth.fortinet.com/api/v1/oauth/token/'
+DEFAULT_BASE_URL = 'https://portal.prod.fortisase.com'
+CLIENT_ID = 'FortiSASE'
+EXPIRY_SKEW = 60
+SEATS_ENDPOINT = '/endpoint/fct/api/public/v1/sase_to_ems/cloud/fortiguard_cloud_vpn/get_seats'
+TRAFFIC_TYPES = ('InboundUser', 'PrivateAccess', 'InboundThinEdge', 'FortiExtender', 'Outbound', 'FortiGate')
+SECTIONS = {
+    **{f'fortisase_bps_{name.lower()}': ('/monitor-api/v1/traffic-history', {'type': name})
+       for name in TRAFFIC_TYPES},
+    'fortisase_swg_sessions': ('/monitor-api/v1/user/swg/sessions', None),
+    'fortisase_vpn_sessions': ('/monitor-api/v1/user/vpn/sessions', None),
+    'fortisase_remote_certificate': ('/resource-api/v2/system/certificate/remote-certificates', None),
+    'fortisase_license': (SEATS_ENDPOINT, None),
+}
+
+
+class APIError(Exception):
+    """
+    A diagnostic that contains no credentials or response bodies.
+
+    Input:
+        message: Sanitized error description supplied by the caller.
+
+    Output:
+        Exception instance containing a safe diagnostic message.
+
+    """
+
+
+def positive_int(value):
+    """
+    Validate a positive integer command-line value.
+
+    Input:
+        value: Raw value to validate or convert.
+
+    Output:
+        Positive integer; raises ArgumentTypeError when the value is not positive.
+
+    """
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return value
+
+
+def https_url(value):
+    """
+    Validate and normalize the configured portal origin.
+
+    Input:
+        value: Raw value to validate or convert.
+
+    Output:
+        HTTPS origin without a trailing slash; rejects credentials, paths and query strings.
+
+    """
+    url = urlsplit(value)
+    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
+        raise argparse.ArgumentTypeError('base URL must be an HTTPS origin without credentials')
+    return value.rstrip('/')
+
+
+def parse_arguments(argv):
+    """
+    Parse the special agent command-line options.
+
+    Input:
+        argv: Command-line arguments excluding the executable name; None uses process arguments.
+
+    Output:
+        Namespace containing validated connection settings and one credential source.
+
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--api-id', required=True)
+    secrets = parser.add_mutually_exclusive_group(required=True)
+    secrets.add_argument('--api-password-id', help='Checkmk password-store reference ID:FILE')
+    secrets.add_argument('--password-from-stdin', action='store_true')
+    parser.add_argument('--base-url', type=https_url, default=DEFAULT_BASE_URL)
+    parser.add_argument('--timeout', type=positive_int, default=30)
+    parser.add_argument('--cache-ttl', type=positive_int, default=3000,
+                        help='Fallback lifetime if OAuth omits expires_in (seconds)')
+    parser.add_argument('--no-verify-tls', action='store_true')
+    parser.add_argument('--debug', action='store_true', help='Log request paths and status codes only')
+    return parser.parse_args(argv)
+
+
+def password_from_reference(reference):
+    """
+    Resolve a password from a Checkmk password-store reference.
+
+    Input:
+        reference: Checkmk password reference combining an ID and an absolute file path.
+
+    Output:
+        Non-empty password string; raises APIError without exposing store data on failure.
+
+    """
+    ident, separator, filename = reference.partition(':/')
+    if not separator or not ident or not filename:
+        raise APIError('Invalid password reference; save rule and activate changes')
+    from cmk.utils.password_store import lookup
+    try:
+        value = lookup(Path('/' + filename), ident)
+    except (OSError, ValueError):
+        raise APIError('Cannot resolve password reference; save rule and activate changes') from None
+    if not isinstance(value, str) or not value:
+        raise APIError('Referenced password is empty or invalid')
+    return value
+
+
+def _cache_dir():
+    """
+    Select and secure the site-local OAuth token cache directory.
+
+    Input:
+        None.
+
+    Output:
+        Mode 0700 directory owned by the current user; raises for unsafe or inaccessible paths.
+
+    """
+    omd_root = os.environ.get('OMD_ROOT')
+    path = (Path(omd_root) / 'tmp/fortisase' if omd_root else
+            Path(tempfile.gettempdir()) / f'fortisase-{os.getuid()}')
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise APIError('Unsafe token cache directory')
+    path.chmod(0o700)
+    return path
+
+
+class FortiSASEClient:
+    """
+    FortiSASE client for API collection and OAuth token management.
+
+    Input:
+        args: Parsed special agent command-line settings.
+        password: API password resolved from the password store or stdin.
+
+    Output:
+        Client instance with an HTTP session and a credential-specific token cache.
+
+    """
+    def __init__(self, args, password):
+        """
+        Initialize the FortiSASE API client and its credential-specific cache.
+
+        Input:
+            args: Parsed special agent command-line settings.
+            password: API password resolved from the password store or stdin.
+
+        Output:
+            None; prepares the HTTP session, token state and cache path.
+
+        """
+        self.api_id = args.api_id
+        self.api_password = password
+        self.base_url = args.base_url
+        self.timeout = args.timeout
+        self.cache_ttl = args.cache_ttl
+        self.debug = args.debug
+        self.verify = not args.no_verify_tls
+        self.session = requests.Session()
+        self._token = None
+        self._memo = {}
+        # Separate tenants, origins and rotated credentials without exposing IDs.
+        key = hashlib.sha256(json.dumps([self.api_id, self.base_url, password]).encode()).hexdigest()
+        self._cache_file = _cache_dir() / f'{key}.json'
+
+    def _log(self, text):
+        """
+        Write sanitized diagnostics when debug logging is enabled.
+
+        Input:
+            text: Sanitized diagnostic text to write when debug logging is enabled.
+
+        Output:
+            None; writes the supplied text to stderr only in debug mode.
+
+        """
+        if self.debug:
+            print(text, file=sys.stderr)
+
+    @contextmanager
+    def locked(self):
+        """
+        Serialize collectors sharing the same credential cache.
+
+        Input:
+            Current instance state.
+
+        Output:
+            Yields while holding an exclusive file lock; releases the lock when the context exits.
+
+        """
+        descriptor = os.open(self._cache_file.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+
+    def _read_cache(self):
+        """
+        Load and validate persisted OAuth token metadata.
+
+        Input:
+            Current instance state.
+
+        Output:
+            Cached token dictionary with a finite expiry, or None for missing or invalid data.
+
+        """
+        try:
+            cache = json.loads(self._cache_file.read_text())
+            if not isinstance(cache, dict):
+                return None
+            expiry = float(cache.get('expires_at', 0))
+            if not math.isfinite(expiry):
+                return None
+            cache['expires_at'] = expiry
+            return cache
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _write_cache(self, token, refresh_token, expires_in):
+        """
+        Persist OAuth tokens atomically with restricted permissions.
+
+        Input:
+            token: OAuth access token to cache.
+            refresh_token: OAuth refresh token, or None to use password authentication.
+            expires_in: Token lifetime in seconds reported by the OAuth response.
+
+        Output:
+            None; replaces the mode 0600 cache file with tokens and a skew-adjusted expiry.
+
+        """
+        try:
+            ttl = float(expires_in)
+            if not math.isfinite(ttl):
+                raise ValueError
+        except (ValueError, TypeError):
+            ttl = self.cache_ttl
+        data = {'token': token, 'refresh_token': refresh_token,
+                'expires_at': time.time() + max(0, ttl - EXPIRY_SKEW)}
+        descriptor, temporary = tempfile.mkstemp(dir=self._cache_file.parent)
+        try:
+            with os.fdopen(descriptor, 'w') as handle:
+                json.dump(data, handle)
+            os.replace(temporary, self._cache_file)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def _request(self, method, url, **kwargs):
+        """
+        Execute a bounded HTTPS request and emit sanitized diagnostics.
+
+        Input:
+            method: HTTP method to invoke on the requests session.
+            url: HTTPS endpoint URL without credentials.
+            kwargs: Additional HTTP request arguments such as JSON payload, headers or query parameters.
+
+        Output:
+            HTTP response; raises APIError for transport failures without logging response bodies.
+
+        """
+        try:
+            response = getattr(self.session, method)(url, timeout=self.timeout,
+                verify=self.verify, allow_redirects=False, **kwargs)
+        except requests.RequestException:
+            raise APIError('HTTPS request failed (connection, timeout or TLS)') from None
+        self._log(f'{method.upper()} {urlsplit(url).path}: HTTP {response.status_code}')
+        return response
+
+    def _grant(self, refresh_token=None):
+        """
+        Obtain OAuth tokens using a refresh token or API credentials.
+
+        Input:
+            refresh_token: OAuth refresh token, or None to use password authentication.
+
+        Output:
+            None; updates the active token and cache, or raises APIError for invalid OAuth responses.
+
+        """
+        payload = {'client_id': CLIENT_ID, 'client_secret': ''}
+        if refresh_token:
+            payload.update(grant_type='refresh_token', refresh_token=refresh_token)
+        else:
+            payload.update(grant_type='password', username=self.api_id, password=self.api_password)
+        response = self._request('post', AUTH_URL, json=payload)
+        if response.status_code != 200:
+            raise APIError(f'OAuth authentication failed (HTTP {response.status_code})')
+        try:
+            data = response.json()
+        except ValueError:
+            raise APIError('Invalid OAuth JSON response') from None
+        if not isinstance(data, dict) or not isinstance(data.get('access_token'), str) or not data['access_token']:
+            raise APIError('OAuth response has no access token')
+        self._token = data['access_token']
+        self._write_cache(self._token, data.get('refresh_token') or refresh_token, data.get('expires_in'))
+
+    def authenticate(self, force=False):
+        """
+        Obtain an access token from cache, refresh or password authentication.
+
+        Input:
+            force: Whether to bypass cached tokens and use a password grant.
+
+        Output:
+            None; updates the active token, falling back to a password grant after refresh failure.
+
+        """
+        cache = None if force else self._read_cache()
+        if cache and isinstance(cache.get('token'), str) and cache['token'] and cache['expires_at'] > time.time():
+            self._token = cache['token']
+            return
+        if cache and cache.get('refresh_token'):
+            try:
+                self._grant(cache['refresh_token'])
+                return
+            except APIError:
+                self._log('Refresh failed; attempting password grant')
+        self._grant()
+
+    def get(self, endpoint, params=None):
+        """
+        Fetch and validate a portal resource with one retry after HTTP 401.
+
+        Input:
+            endpoint: Portal API endpoint path.
+            params: Validated Checkmk rule parameters or API query parameters.
+
+        Output:
+            Decoded JSON response, memoized per endpoint and query; raises APIError on failure.
+
+        """
+        key = endpoint + json.dumps(params, sort_keys=True)
+        if key in self._memo:
+            return self._memo[key]
+        for attempt in range(2):
+            response = self._request('get', self.base_url + endpoint, params=params,
+                headers={'Authorization': f'Bearer {self._token}', 'Accept': 'application/json'})
+            if response.status_code != 401 or attempt:
+                break
+            self._cache_file.unlink(missing_ok=True)
+            self.authenticate(force=True)
+        if response.status_code != 200:
+            raise APIError(f'API request failed (HTTP {response.status_code})')
+        try:
+            data = response.json()
+        except ValueError:
+            raise APIError('Invalid API JSON response') from None
+        if not isinstance(data, dict) or data.get('code', 200) not in (0, 200, '200'):
+            raise APIError('API reported an application error')
+        payload = data.get('data')
+        if endpoint == SEATS_ENDPOINT:
+            result = data.get('result')
+            if not isinstance(result, dict) or type(result.get('retval')) is not int or result['retval'] != 1:
+                raise APIError('Seat API reported an application error')
+            expected = (dict,)
+        else:
+            expected = (dict, list) if endpoint.endswith('traffic-history') else (list,)
+        if not isinstance(payload, expected):
+            raise APIError('API response has an unexpected data structure')
+        self._memo[key] = data
+        return data
+
+
+
+
+def monitoring_payload(name, data):
+    """
+    Select license counts without exporting unrelated response fields.
+
+    Input:
+        name: Agent section identifier.
+        data: Validated API response envelope.
+
+    Output:
+        Whitelisted monitoring payload, or the original envelope for established sections.
+
+    """
+    if name == 'fortisase_license':
+        payload = data.get('data')
+        result = data.get('result')
+        if (not isinstance(payload, dict) or not isinstance(result, dict)
+                or type(result.get('retval')) is not int or result['retval'] != 1):
+            raise APIError('Invalid seat API response')
+        return {'result': {'retval': 1}, 'data': {
+            key: payload.get(key) for key in ('seats', 'used')}}
+    return data
+
+
+def emit(name, data):
+    """
+    Write one JSON section in the Checkmk special agent protocol.
+
+    Input:
+        name: Checkmk section name emitted in the agent output.
+        data: JSON-serializable payload for the emitted agent section.
+
+    Output:
+        None; writes the section header and single-line JSON payload to stdout.
+
+    """
+    print(f'<<<{name}:sep(0)>>>')
+    print(json.dumps(data, separators=(',', ':')))
+
+
+def collect(client):
+    """
+    Collect unique endpoints while preserving successful partial results.
+
+    Input:
+        client: Authenticated API client used to collect FortiSASE resources.
+
+    Output:
+        None; emits successful resource sections and an API status section with coverage and errors.
+
+    """
+    started = time.monotonic()
+    status = {'errors': [], 'successful': 0, 'total': len(set(
+        endpoint + json.dumps(params, sort_keys=True) for endpoint, params in SECTIONS.values()))}
+    try:
+        client.authenticate()
+    except APIError as error:
+        status['errors'].append(f'Authentication: {error}')
+        status['authentication_failed'] = True
+    else:
+        responses = {}
+        for name, (endpoint, params) in SECTIONS.items():
+            key = endpoint + json.dumps(params, sort_keys=True)
+            if key not in responses:
+                try:
+                    responses[key] = monitoring_payload(name, client.get(endpoint, params))
+                    status['successful'] += 1
+                except APIError as error:
+                    responses[key] = None
+                    label = endpoint + (f" ({params['type']})" if params else '')
+                    status['errors'].append(f'{label}: {error}')
+            if responses[key] is not None:
+                emit(name, responses[key])
+    status['duration'] = time.monotonic() - started
+    emit('fortisase_api', status)
+
+
+def main(argv=None):
+    """
+    Run the special agent with secure credential resolution and cache locking.
+
+    Input:
+        argv: Command-line arguments excluding the executable name; None uses process arguments.
+
+    Output:
+        Process exit status: 0 after API status emission, 1 for initialization failure.
+
+    """
+    args = parse_arguments(argv)
+    try:
+        password = (password_from_reference(args.api_password_id) if args.api_password_id
+                    else sys.stdin.readline().rstrip('\r\n'))
+        if not password:
+            raise APIError('No API password provided')
+        client = FortiSASEClient(args, password)
+        try:
+            with client.locked():
+                collect(client)
+        finally:
+            client.session.close()
+    except (APIError, OSError, ImportError):
+        print('FortiSASE initialization failed; check credentials, password store and cache permissions', file=sys.stderr)
+        return 1
+    # API failures are represented by the FortiSASE API service.
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
